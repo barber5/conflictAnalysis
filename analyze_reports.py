@@ -1,7 +1,13 @@
+import pickle
 import sqlite3
+import datetime as dt
+from dateutil import parser
 from config import APPROVE_ACTIONS, REMOVE_ACTIONS
 from util import authorize
 import csv
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
 
 COMMON_ACTION_THRESHOLD = 100
 IGNORE_MODS = {'BotTerminator', 'CovidPoliticsBot'}
@@ -58,6 +64,41 @@ def get_all_comments_from_db():
     return list(cid_idx.values())
 
 
+def get_codebook():
+    with open('codebook.pkl', 'rb') as fi:
+        auto_map = pickle.load(fi)
+    result = {}
+    for category, reports in auto_map.items():
+        for report in reports:
+            if report in result:
+                print('duplicate in codebook, report: {}, existing: {}, current: {}'.format(report, result[report],
+                                                                                            category))
+            if category == 'o':
+                result[report] = 'other'
+            elif category == 'c':
+                result[report] = 'incivility'
+            elif category == 'q':
+                result[report] = 'information quality'
+            elif category == 'p':
+                result[report] = 'politics'
+            elif category == 's':
+                result[report] = 'spam'
+            elif category == 'n':
+                result[report] = 'no report'
+            elif category == 'b':
+                result[report] = 'bot generated report'
+    return result
+
+
+def code_reports(comments):
+    codebook = get_codebook()
+    for comment in comments:
+        for report in comment['reports'].values():
+            reason = report['report']
+            report['report'] = codebook[reason]
+    return comments
+
+
 def fix_none_reports(comments=None):
     if comments is None:
         comments = get_all_comments_from_db()
@@ -94,18 +135,18 @@ def count_removal_reasons(comments=None):
             if reason not in count_idx:
                 count_idx[reason] = 0
             count_idx[reason] += 1
-        if len(comment['reports']) == 0:
-            if 'none' not in count_idx:
-                count_idx['none'] = 0
-            count_idx['none'] += 1
-    for reason, count in count_idx.items():
-        print('{}\t{}'.format(reason, count))
+    fig, ax = plt.subplots(figsize=(10, 10))
+    ax.set_title('Report type statistics')
+    ax.set_xlabel('report reason')
+    ax.set_ylabel('comment count')
+    ax.bar(count_idx.keys(), count_idx.values())
+    plt.show()
 
 
 def get_most_recent_action(comment):
     # get most recent action
-    most_recent_action = comment['actions'].values()[0]
-    most_recent_time = comment['actions'].values()[0]['action_created']
+    most_recent_action = list(comment['actions'].values())[0]
+    most_recent_time = list(comment['actions'].values())[0]['action_created']
     for action in comment['actions'].values():
         if action['action_created'] > most_recent_time:
             most_recent_action = action
@@ -202,14 +243,12 @@ def mod_action_statistics(comments=None):
             if action_name not in reason_action_count_idx['none']:
                 reason_action_count_idx['none'][action_name] = 0
             reason_action_count_idx['none'][action_name] += 1
-    print('report reason plus final action statistics')
+    df_array = []
     for reason, count_meta in reason_action_count_idx.items():
-        total_actions = 0
-        for action, count in count_meta.items():
-            total_actions += count
-        if total_actions > COMMON_ACTION_THRESHOLD:
-            for action, count in count_meta.items():
-                print('{}\t{}\t{}'.format(reason, action, count))
+        df_array.append(count_meta)
+    df = pd.DataFrame(df_array, index=reason_action_count_idx.keys())
+    df.plot(kind='bar')
+    plt.show()
 
 
 def compare_conflict_to_non_conflict(comments=None):
@@ -415,6 +454,68 @@ def write_clean_csv(comments):
                 '''
 
 
+def get_report_number_vector(comments):
+    result = []
+    for comment in comments:
+        total_reports = 0
+        for report in comment['reports'].values():
+            total_reports += report['count']
+        result.append(total_reports)
+    return np.array(result)
+
+
+def pandas_report_averages(index_str, comment_type_array):
+    counts_array = []
+    for ct in comment_type_array:
+        cc = get_report_number_vector(ct)
+        counts_array.append(cc)
+    df = pd.DataFrame(counts_array, index_str)
+    df1 = df.T
+    df1.columns = index_str
+    a = df1.describe()
+    means = a.loc['mean'].values.tolist()
+    stdevs = a.loc['std'].values.tolist()
+    counts = a.loc['count'].values.tolist()
+    sem = df.sem(axis=1).values.tolist()
+    index = np.arange(len(df1.columns))
+
+    conf_intervals = []
+    for i in range(len(means)):
+        ci = 1.96 * stdevs[i] / (counts[i] ** (0.5))
+        conf_intervals.append(ci)
+
+    fig, ax = plt.subplots(figsize=(10, 10))
+    ax.set_xticks(index)
+    ax.set_xticklabels(df1.columns)
+    ax.set_title('Average number of reports per comment')
+    plt.bar(index, means, yerr=sem, capsize=10)
+    plt.tight_layout()
+    plt.show()
+
+
+def conflict_race_vs_revisit(conflict_comments):
+    race = []
+    revisit = []
+    for comment in conflict_comments:
+        first_action = list(comment['actions'].values())[0]
+        first_action = parser.parse(first_action['action_created'])
+        second_action = list(comment['actions'].values())[1]
+        second_action = parser.parse(second_action['action_created'])
+        delta = abs(first_action - second_action)
+        if delta > dt.timedelta(minutes=30):
+            revisit.append(comment)
+        else:
+            race.append(comment)
+    return race, revisit
+
+
+def plot_proportions(index_str, proportions_array):
+    df = pd.DataFrame(proportions_array,
+                      index=index_str)
+    df.plot(kind='bar', title='Report type proportions')
+    plt.show()
+
+
 def analyze_conflict_and_concordance(comments):
     conflict_comments = []
     concordance_comments = []
@@ -429,10 +530,26 @@ def analyze_conflict_and_concordance(comments):
             concordance_comments.append(comment)
         else:
             neither_comments.append(comment)
+    fig, ax = plt.subplots(figsize=(10, 10))
+    ax.set_title('Action category statistics')
+    ax.set_xlabel('action category')
+    ax.set_ylabel('comment count')
+    count_x = ['complex', 'conflict', 'concordance', 'normal']
+    count_y = [len(complex_comments), len(conflict_comments), len(concordance_comments), len(neither_comments)]
+    print(count_x)
+    print(count_y)
+    ax.bar(count_x, count_y)
+    for i, v in enumerate(count_y):
+        ax.text(v + 3, i + .25, str(v), color='blue', fontweight='bold')
+    plt.show()
+
     complex_avg = get_average_number_of_reports(complex_comments)
     conflict_avg = get_average_number_of_reports(conflict_comments)
     concordance_avg = get_average_number_of_reports(concordance_comments)
     neither_avg = get_average_number_of_reports(neither_comments)
+
+    pandas_report_averages(['complex', 'conflict', 'concordance', 'normal'],
+                           [complex_comments, conflict_comments, concordance_comments, neither_comments])
 
     complex_max = get_max_reports(complex_comments)
     conflict_max = get_max_reports(conflict_comments)
@@ -443,7 +560,13 @@ def analyze_conflict_and_concordance(comments):
     conflict_proportions = get_report_proportions(conflict_comments)
     concordance_proportions = get_report_proportions(concordance_comments)
     neither_proportions = get_report_proportions(neither_comments)
-    print('hi')
+    plot_proportions(['complex', 'conflict', 'concordance', 'normal'],
+                     [complex_proportions, conflict_proportions, concordance_proportions, neither_proportions])
+    race, revisit = conflict_race_vs_revisit(conflict_comments)
+    pandas_report_averages(['race', 'revisit'], [race, revisit])
+    race_proportions = get_report_proportions(race)
+    revisit_proportions = get_report_proportions(revisit)
+    plot_proportions(['race', 'revisit'], [race_proportions, revisit_proportions])
 
 
 def get_report_proportions(comments):
@@ -455,14 +578,10 @@ def get_report_proportions(comments):
                 report_counts[report_name] = 0.0
             report_counts[report_name] += 1.0
     result = {}
-    other_total = 0.0
     for report, count in report_counts.items():
         proportion = count / len(comments)
         if proportion > 0.01:
             result[report] = proportion
-        else:
-            other_total += proportion
-    result['Other'] = other_total
     return result
 
 
@@ -472,6 +591,7 @@ def get_average_number_of_reports(comments):
         for report in comment['reports'].values():
             total_reports += report['count']
     return total_reports / len(comments)
+
 
 def get_max_reports(comments):
     max_reports = -1
@@ -488,11 +608,14 @@ def get_max_reports(comments):
 
 if __name__ == "__main__":
     comments_all = get_all_comments_from_db()
+    comments_all = code_reports(comments_all)
+    print('got {} comments'.format(len(comments_all)))
+    count_removal_reasons(comments_all)
+    mod_action_statistics(comments_all)
     analyze_conflict_and_concordance(comments_all)
     # fix_none_reports(comments_all)
     # analyze_report_long_tail(comments_all)
-    # count_removal_reasons(comments_all)
-    # mod_action_statistics(comments_all)
+
     # mod_conflict_statistics(comments_all)
     # compare_conflict_to_non_conflict(comments_all)
     # last_entry(comments_all)
