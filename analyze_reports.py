@@ -1,6 +1,9 @@
 import pickle
+import random
 import sqlite3
 import datetime as dt
+from math import log
+
 from dateutil import parser
 from config import APPROVE_ACTIONS, REMOVE_ACTIONS
 from util import authorize
@@ -8,6 +11,8 @@ import csv
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+from nltk.corpus import stopwords
+from nltk.tokenize import word_tokenize
 
 COMMON_ACTION_THRESHOLD = 100
 IGNORE_MODS = {'BotTerminator', 'CovidPoliticsBot'}
@@ -493,7 +498,7 @@ def pandas_report_averages(index_str, comment_type_array):
     plt.show()
 
 
-def conflict_race_vs_revisit(conflict_comments):
+def race_vs_revisit(conflict_comments):
     race = []
     revisit = []
     for comment in conflict_comments:
@@ -517,19 +522,8 @@ def plot_proportions(index_str, proportions_array):
 
 
 def analyze_conflict_and_concordance(comments):
-    conflict_comments = []
-    concordance_comments = []
-    complex_comments = []
-    neither_comments = []
-    for comment in comments:
-        if get_number_of_mods(comment) > 2:
-            complex_comments.append(comment)
-        elif detect_conflict(comment):
-            conflict_comments.append(comment)
-        elif detect_concordance(comment):
-            concordance_comments.append(comment)
-        else:
-            neither_comments.append(comment)
+    complex_comments, concordance_comments, conflict_comments, neither_comments = categorize_comments_by_mod_action(
+        comments)
     fig, ax = plt.subplots(figsize=(10, 10))
     ax.set_title('Action category statistics')
     ax.set_xlabel('action category')
@@ -562,11 +556,36 @@ def analyze_conflict_and_concordance(comments):
     neither_proportions = get_report_proportions(neither_comments)
     plot_proportions(['complex', 'conflict', 'concordance', 'normal'],
                      [complex_proportions, conflict_proportions, concordance_proportions, neither_proportions])
-    race, revisit = conflict_race_vs_revisit(conflict_comments)
+    race, revisit = race_vs_revisit(conflict_comments)
     pandas_report_averages(['race', 'revisit'], [race, revisit])
     race_proportions = get_report_proportions(race)
     revisit_proportions = get_report_proportions(revisit)
     plot_proportions(['race', 'revisit'], [race_proportions, revisit_proportions])
+
+
+def categorize_comments_by_mod_action(comments):
+    conflict_comments = []
+    concordance_comments = []
+    complex_comments = []
+    neither_comments = []
+    for comment in comments:
+        if get_number_of_mods(comment) > 2:
+            complex_comments.append(comment)
+        elif detect_conflict(comment):
+            conflict_comments.append(comment)
+        elif detect_concordance(comment):
+            concordance_comments.append(comment)
+        else:
+            neither_comments.append(comment)
+    return complex_comments, concordance_comments, conflict_comments, neither_comments
+
+
+def sample_comments(comments, number):
+    random.shuffle(comments)
+    result = []
+    for i in range(number):
+        result.append(comments[i])
+    return result
 
 
 def get_report_proportions(comments):
@@ -606,13 +625,135 @@ def get_max_reports(comments):
     return max_reports
 
 
+def get_concordance_vs_conflict_samples(comments, sample_size=100):
+    complex_comments, concordance_comments, conflict_comments, neither_comments = categorize_comments_by_mod_action(
+        comments)
+    concordance_sample = sample_comments(concordance_comments, sample_size)
+    conflict_sample = sample_comments(conflict_comments, sample_size)
+    w = csv.writer(open("concordance.csv", "w", encoding="utf-8"))
+    w.writerow(['comment_id, comment_body', 'last_action'])
+    for c in concordance_sample:
+        action = get_most_recent_action(c)
+        w.writerow([c['cid'], c['body'], action['action']])
+    w = csv.writer(open("conflict.csv", "w", encoding="utf-8"))
+    w.writerow(['comment_id, comment_body', 'last_action'])
+    for c in conflict_sample:
+        action = get_most_recent_action(c)
+        w.writerow([c['cid'], c['body'], action['action']])
+
+
+def get_bag_of_words_for_comments(comments):
+    word_freq_counts = {}
+    for c in comments:
+        body = c['body']
+        stop_words = set(stopwords.words('english'))
+        word_tokens = word_tokenize(body.lower())
+        filtered_words = set([w for w in word_tokens if w not in stop_words])
+        for fw in filtered_words:
+            if fw not in word_freq_counts:
+                word_freq_counts[fw] = 0.0
+            word_freq_counts[fw] += 1.0
+    result = {}
+    for w, count in word_freq_counts.items():
+        result[w] = count / len(comments)
+    return result
+
+
+def get_approve_remove_comments(comments):
+    approved = []
+    removed = []
+    for c in comments:
+        action = get_most_recent_action(c)['action']
+        if action in APPROVE_ACTIONS:
+            approved.append(c)
+        else:
+            removed.append(c)
+    return approved, removed
+
+
+def get_odds_ratios(comments1, comments2, frequency_threshold, or_threshold):
+    all_words = set(comments1.keys()).union(set(comments2.keys()))
+    result = {}
+    for w in all_words:
+        if w not in comments1:
+            c1_freq = 0.0
+        else:
+            c1_freq = comments1[w]
+        if w not in comments2:
+            c2_freq = 0.0
+        else:
+            c2_freq = comments2[w]
+        if c1_freq > frequency_threshold or c2_freq > frequency_threshold:
+            if c1_freq == 0.0:
+                if c2_freq == 0.0:
+                    odds_ratio = 0.0
+                else:
+                    continue
+                    odds_ratio = -float('inf')
+            else:
+                if c2_freq == 0.0:
+                    continue
+                    odds_ratio = float('inf')
+                else:
+                    odds_ratio = log(c1_freq/ c2_freq, 2)
+            if abs(odds_ratio) > or_threshold:
+                result[w] = odds_ratio
+    return result
+
+
+def plot_odds_ratio(odds_r, labels, top_k=25):
+    sorted_odds = dict(sorted(odds_r.items(), key=lambda item: item[1]))
+    lo_x = list(reversed(list(sorted_odds.keys())[:top_k]))
+    lo_y = [abs(sorted_odds[k]) for k in lo_x]
+    hi_x = list(sorted_odds.keys())[-top_k:]
+    hi_y = [abs(sorted_odds[k]) for k in hi_x]
+    fig, (ax_lo, ax_hi) = plt.subplots(ncols=2)
+    ax_lo.barh(lo_x, lo_y)
+    ax_lo.set_title('more likely to have been {}'.format(labels[1]))
+    ax_hi.barh(hi_x, hi_y)
+    ax_hi.set_title('more likely to have been {}'.format(labels[0]))
+    fig.suptitle('Odds ratio comparisons')
+    plt.show()
+
+
+    print(sorted_odds)
+
+
+def bag_of_words_compare(comments, word_freq_cutoff=5, frequency_threshold=0.005, or_threshold=0.75):
+    complex_comments, concordance_comments, conflict_comments, neither_comments = categorize_comments_by_mod_action(
+        comments)
+    approved_normal, removed_normal = get_approve_remove_comments(neither_comments)
+    race_conc, revisit_conc = race_vs_revisit(concordance_comments)
+    race_conf, revisit_conf = race_vs_revisit(conflict_comments)
+
+    approved_sample = sample_comments(approved_normal, 5000)
+    removed_sample = sample_comments(removed_normal, 5000)
+
+    approved_freq = get_bag_of_words_for_comments(approved_sample)
+    removed_freq = get_bag_of_words_for_comments(removed_sample)
+    conflict_freq = get_bag_of_words_for_comments(conflict_comments)
+    concordance_freq = get_bag_of_words_for_comments(concordance_comments)
+    race_conc_freq = get_bag_of_words_for_comments(race_conc)
+    race_conf_freq = get_bag_of_words_for_comments(race_conf)
+    revisit_conc_freq = get_bag_of_words_for_comments(revisit_conc)
+    revisit_conf_freq = get_bag_of_words_for_comments(revisit_conf)
+
+    ar_or = get_odds_ratios(approved_freq, removed_freq, frequency_threshold, or_threshold)
+    cc_race_or = get_odds_ratios(race_conf_freq, race_conc_freq, frequency_threshold, or_threshold)
+    cc_revisit_or = get_odds_ratios(revisit_conf_freq, revisit_conc_freq, frequency_threshold, or_threshold)
+    plot_odds_ratio(ar_or, ['accepted by moderator', 'rejected by moderator'])
+    plot_odds_ratio(cc_race_or, ['race condition and conflicted', 'race condition and concordant'])
+    plot_odds_ratio(cc_revisit_or, ['revisit and conflicted', 'revisit and concordant'])
+
+
 if __name__ == "__main__":
     comments_all = get_all_comments_from_db()
     comments_all = code_reports(comments_all)
-    print('got {} comments'.format(len(comments_all)))
-    count_removal_reasons(comments_all)
-    mod_action_statistics(comments_all)
-    analyze_conflict_and_concordance(comments_all)
+    bag_of_words_compare(comments_all)
+    # print('got {} comments'.format(len(comments_all)))
+    # count_removal_reasons(comments_all)
+    # mod_action_statistics(comments_all)
+    # analyze_conflict_and_concordance(comments_all)
     # fix_none_reports(comments_all)
     # analyze_report_long_tail(comments_all)
 
