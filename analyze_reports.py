@@ -5,6 +5,7 @@ import datetime as dt
 from math import log
 
 from dateutil import parser
+import scipy.stats as stats
 from config import APPROVE_ACTIONS, REMOVE_ACTIONS
 from util import authorize
 import csv
@@ -157,6 +158,25 @@ def get_most_recent_action(comment):
             most_recent_action = action
             most_recent_time = action['action_created']
     return most_recent_action
+
+
+def get_most_recent_action_by_mod(comment):
+    mod_action_idx = {}
+    for action in comment['actions'].values():
+        mod = action['moderator']
+        if mod not in mod_action_idx:
+            mod_action_idx[mod] = []
+        mod_action_idx[mod].append(action)
+    result = {}
+    for mod, actions in mod_action_idx.items():
+        most_recent_action = actions[0]
+        most_recent_time = actions[0]['action_created']
+        for action in actions:
+            if action['action_created'] > most_recent_time:
+                most_recent_action = action
+                most_recent_time = action['action_created']
+        result[mod] = most_recent_action
+    return result
 
 
 def detect_conflict(comment):
@@ -714,8 +734,6 @@ def plot_odds_ratio(odds_r, labels, top_k=25):
     ax_hi.set_title('more likely to have been {}'.format(labels[0]))
     fig.suptitle('Odds ratio comparisons')
     plt.show()
-
-
     print(sorted_odds)
 
 
@@ -746,10 +764,72 @@ def bag_of_words_compare(comments, word_freq_cutoff=5, frequency_threshold=0.005
     plot_odds_ratio(cc_revisit_or, ['revisit and conflicted', 'revisit and concordant'])
 
 
+def moderator_analysis(comments, min_action_threshold=10):
+    complex_comments, concordance_comments, conflict_comments, neither_comments = categorize_comments_by_mod_action(
+        comments)
+    race_conf, revisit_conf = race_vs_revisit(conflict_comments)
+    race_conc, revisit_conc = race_vs_revisit(concordance_comments)
+    # first get a baseline for each mod
+    mod_baseline_idx = {}
+    for comment in neither_comments:
+        action = get_most_recent_action(comment)
+        mod = action['moderator']
+        action_name = action['action']
+        if mod not in mod_baseline_idx:
+            mod_baseline_idx[mod] = []
+        if action_name in APPROVE_ACTIONS:
+            mod_baseline_idx[mod].append(1)
+        else:
+            mod_baseline_idx[mod].append(0)
+
+
+    # then see if there's a sig diff when they are in conflict
+    # i.e. they are acting unusually on comments where they are in conflict
+    mod_conflict_idx = {}
+    for comment in race_conf:
+        mod_action_dict = get_most_recent_action_by_mod(comment)
+        for mod, action in mod_action_dict.items():
+            if mod not in mod_conflict_idx:
+                mod_conflict_idx[mod] = []
+            action_name = action['action']
+            if action_name in APPROVE_ACTIONS:
+                mod_conflict_idx[mod].append(1)
+            else:
+                mod_conflict_idx[mod].append(0)
+    bonferonni_m = 0.0
+    for mod in set(mod_conflict_idx.keys()).intersection(set(mod_baseline_idx.keys())):
+        if len(mod_conflict_idx[mod]) < min_action_threshold or len(mod_baseline_idx[mod]) < min_action_threshold:
+            continue
+        bonferonni_m += 1.0
+    corrected_alpha = 0.05 / bonferonni_m
+    print('bonferonni alpha for alpha=0.05 is {}'.format(corrected_alpha))
+    for mod in set(mod_conflict_idx.keys()).intersection(set(mod_baseline_idx.keys())):
+        baseline_actions = np.array(mod_baseline_idx[mod])
+        conf_actions = np.array(mod_conflict_idx[mod])
+        if len(conf_actions) < min_action_threshold or len(mod_baseline_idx[mod]) < min_action_threshold:
+            continue
+        (stat, p_value) = stats.ttest_ind(a=baseline_actions, b=conf_actions, equal_var=False)
+        if p_value < corrected_alpha:
+            sig_chars = '***'
+        else:
+            sig_chars = ''
+        print('\n\n\n\n----------------------------------------')
+        print('stats for {}'.format(mod))
+        print('approval proportion baseline {}'.format(baseline_actions.mean()))
+        print('removal proportion baseline {}'.format(1-baseline_actions.mean()))
+        print('baseline total actions {}'.format(len(baseline_actions)))
+        print('approval proportion conflict-race {}'.format(conf_actions.mean()))
+        print('remove proportion conflict-race {}'.format(1-conf_actions.mean()))
+        print('conflict-race total actions {}'.format(len(conf_actions)))
+        print('t={}, p-value={}{}'.format(stat, p_value, sig_chars))
+        print('----------------------------------------')
+
+
+
 if __name__ == "__main__":
     comments_all = get_all_comments_from_db()
     comments_all = code_reports(comments_all)
-    bag_of_words_compare(comments_all)
+    moderator_analysis(comments_all)
     # print('got {} comments'.format(len(comments_all)))
     # count_removal_reasons(comments_all)
     # mod_action_statistics(comments_all)
