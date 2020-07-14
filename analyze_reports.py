@@ -101,7 +101,10 @@ def code_reports(comments):
     for comment in comments:
         for report in comment['reports'].values():
             reason = report['report']
-            report['report'] = codebook[reason]
+            if reason not in codebook:
+                report['report'] = 'no report associated'
+            else:
+                report['report'] = codebook[reason]
     return comments
 
 
