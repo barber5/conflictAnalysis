@@ -63,5 +63,17 @@ def makeCountVec(counts, vocab):
     return vec
 
 
-def topK(beta, vocab, K=10):
-    return [vocab[idx] for idx in (-beta).argsort()[:K]]
+def top_k(beta, vocab, K=10):
+    words = [(vocab[idx]) for idx in (-beta).argsort()[:K]]
+    result = {}
+    for i, word in enumerate(words):
+        result[word] = -1*sorted(-beta)[i]
+    return result
+
+
+def bottom_k(beta, vocab, K=10):
+    words = [(vocab[idx]) for idx in (-beta).argsort()[-K:]]
+    result = {}
+    for i, word in enumerate(words):
+        result[word] = sorted(beta)[i]
+    return result

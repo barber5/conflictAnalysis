@@ -2,10 +2,13 @@ import pickle
 import random
 import sqlite3
 import datetime as dt
+from collections import Counter
 from math import log
-
+import plotly.graph_objects as go
 from dateutil import parser
 import scipy.stats as stats
+
+import sage
 from config import APPROVE_ACTIONS, REMOVE_ACTIONS
 from util import authorize
 import csv
@@ -665,7 +668,7 @@ def get_concordance_vs_conflict_samples(comments, sample_size=100):
         w.writerow([c['cid'], c['body'], action['action']])
 
 
-def get_bag_of_words_for_comments(comments):
+def get_bag_of_words_for_comments(comments, proportion=True):
     word_freq_counts = {}
     for c in comments:
         body = c['body']
@@ -677,8 +680,24 @@ def get_bag_of_words_for_comments(comments):
                 word_freq_counts[fw] = 0.0
             word_freq_counts[fw] += 1.0
     result = {}
+    omit_chars = ['/', '*']
+    omit_words = [')', ',', '?', '.', "'s"]
     for w, count in word_freq_counts.items():
-        result[w] = count / len(comments)
+        skip = False
+        for ow in omit_words:
+            if w == ow:
+                skip = True
+                break
+        for oc in omit_chars:
+            if w.find(oc) != -1:
+                skip = True
+                break
+        if skip:
+            continue
+        if proportion:
+            result[w] = count / len(comments)
+        else:
+            result[w] = count
     return result
 
 
@@ -736,35 +755,149 @@ def plot_odds_ratio(odds_r, labels, top_k=25):
     ax_hi.barh(hi_x, hi_y)
     ax_hi.set_title('more likely to have been {}'.format(labels[0]))
     fig.suptitle('Odds ratio comparisons')
-    plt.show()
-    print(sorted_odds)
+
+
+def get_actions_for_moderator(actions, who):
+    result = []
+    for action in actions:
+        if action['moderator'] == who:
+            result.append(action)
+    return result
+
+
+def get_self_conflicted(comments, who):
+    normal = []
+    conflicted = []
+    for comment in comments:
+        actions = get_actions_for_moderator(comment['actions'].values(), who)
+        if len(actions) == 0:
+            continue
+        elif len(actions) == 1:
+            normal.append(comment)
+        else:
+            approved = False
+            removed = False
+            for action in actions:
+                if action['action'] in APPROVE_ACTIONS:
+                    approved = True
+                if action['action'] in REMOVE_ACTIONS:
+                    removed = True
+            if approved and removed:
+                conflicted.append(comment)
+            else:
+                normal.append(comment)
+    return normal, conflicted
 
 
 def bag_of_words_compare(comments, word_freq_cutoff=5, frequency_threshold=0.005, or_threshold=0.75):
     complex_comments, concordance_comments, conflict_comments, neither_comments = categorize_comments_by_mod_action(
         comments)
-    approved_normal, removed_normal = get_approve_remove_comments(neither_comments)
-    race_conc, revisit_conc = race_vs_revisit(concordance_comments)
-    race_conf, revisit_conf = race_vs_revisit(conflict_comments)
 
-    approved_sample = sample_comments(approved_normal, 5000)
-    removed_sample = sample_comments(removed_normal, 5000)
+    approved_normal, removed_normal = get_approve_remove_comments(neither_comments)
+
+    approved_sample = sample_comments(approved_normal, 10000)
+    removed_sample = sample_comments(removed_normal, 10000)
 
     approved_freq = get_bag_of_words_for_comments(approved_sample)
     removed_freq = get_bag_of_words_for_comments(removed_sample)
-    conflict_freq = get_bag_of_words_for_comments(conflict_comments)
-    concordance_freq = get_bag_of_words_for_comments(concordance_comments)
+    ar_or = get_odds_ratios(approved_freq, removed_freq, frequency_threshold, or_threshold)
+    plot_odds_ratio(ar_or, ['accepted by moderator', 'rejected by moderator'])
+    approved_count = get_bag_of_words_for_comments(approved_sample, proportion=False)
+    removed_count = get_bag_of_words_for_comments(removed_sample, proportion=False)
+    sage_pair(approved_count, removed_count, 'Approve', 'Remove')
+    plt.show()
+
+    # conflict_freq = get_bag_of_words_for_comments(conflict_comments)
+    # concordance_freq = get_bag_of_words_for_comments(concordance_comments)
+    
+    race_conc, revisit_conc = race_vs_revisit(concordance_comments)
+    race_conf, revisit_conf = race_vs_revisit(conflict_comments)
     race_conc_freq = get_bag_of_words_for_comments(race_conc)
     race_conf_freq = get_bag_of_words_for_comments(race_conf)
+    cc_race_or = get_odds_ratios(race_conf_freq, race_conc_freq, frequency_threshold, or_threshold)
+    plot_odds_ratio(cc_race_or, ['race condition and conflicted', 'race condition and concordant'])
+    race_conc_count = get_bag_of_words_for_comments(race_conc, proportion=False)
+    race_conf_count = get_bag_of_words_for_comments(race_conf, proportion=False)
+    sage_pair(race_conc_count, race_conf_count, 'Race concordance', 'Race conflicted')
+    plt.show()
+    
     revisit_conc_freq = get_bag_of_words_for_comments(revisit_conc)
     revisit_conf_freq = get_bag_of_words_for_comments(revisit_conf)
-
-    ar_or = get_odds_ratios(approved_freq, removed_freq, frequency_threshold, or_threshold)
-    cc_race_or = get_odds_ratios(race_conf_freq, race_conc_freq, frequency_threshold, or_threshold)
     cc_revisit_or = get_odds_ratios(revisit_conf_freq, revisit_conc_freq, frequency_threshold, or_threshold)
-    plot_odds_ratio(ar_or, ['accepted by moderator', 'rejected by moderator'])
-    plot_odds_ratio(cc_race_or, ['race condition and conflicted', 'race condition and concordant'])
     plot_odds_ratio(cc_revisit_or, ['revisit and conflicted', 'revisit and concordant'])
+    revisit_conc_count = get_bag_of_words_for_comments(revisit_conc, proportion=False)
+    revisit_conf_count = get_bag_of_words_for_comments(revisit_conf, proportion=False)
+    sage_pair(revisit_conc_count, revisit_conf_count, 'Revisit concordance', 'Revisit conflicted')
+    plt.show()
+
+    self_normal, self_conflicted = get_self_conflicted(neither_comments, 'barber5')
+    self_normal_count = get_bag_of_words_for_comments(self_normal, proportion=False)
+    self_conflicted_count = get_bag_of_words_for_comments(self_conflicted, proportion=False)
+    sage_pair(self_normal_count, self_conflicted_count, 'Normal for barber5', 'Self conflicted for barber5')
+    plt.show()
+
+
+def sage_pair(base_counts, child_counts, base_title, child_title):
+    vocab = [word for word, count in Counter(child_counts).most_common(1000)]
+    x_child = np.array([child_counts[word] for word in vocab])
+    for word in vocab:
+        if word not in base_counts:
+            base_counts[word] = 0
+    x_base = np.array([base_counts[word] for word in vocab]) + 1.
+    mu = np.log(x_base) - np.log(x_base.sum())
+    eta = sage.estimate(x_child, mu)
+    print(sage.top_k(eta, vocab, 20))
+    top_k = sage.top_k(eta, vocab, 20)
+    print(sage.bottom_k(eta, vocab, 20))
+    bottom_k = sage.bottom_k(eta, vocab, 20)
+    (fig, ax) = plt.subplots()
+    ax.set_title('{} vs {} histogram of SAGE scores'.format(base_title, child_title))
+    ax.set_xlabel('SAGE score')
+    ax.set_ylabel('count of terms with score')
+    ax.hist(eta, 20)
+
+    (fig, ax) = plt.subplots()
+    ax.set_title('{} vs {} SAGE score distribution'.format(base_title, child_title))
+    ax.set_xlabel('terms')
+    ax.set_ylabel('SAGE score')
+    ax.plot(sorted(eta))
+
+    lo_x = list(reversed(list(bottom_k.keys())))
+    lo_freqs = []
+    for w in bottom_k:
+        if w not in base_counts:
+            bc = 0
+        else:
+            bc = base_counts[w]
+        if w not in child_counts:
+            cc = 0
+        else:
+            cc = child_counts[w]
+        lo_freqs.append(bc + cc)
+    lo_y = list(reversed(list(bottom_k.values())))
+    hi_x = list(reversed(list(top_k.keys())))
+    hi_freqs = []
+    for w in top_k:
+        if w not in base_counts:
+            bc = 0
+        else:
+            bc = base_counts[w]
+        if w not in child_counts:
+            cc = 0
+        else:
+            cc = child_counts[w]
+        hi_freqs.append( bc + cc)
+    hi_y = list(reversed(list(top_k.values())))
+    fig, axs = plt.subplots(ncols=2, nrows=2)
+    axs[0][0].barh(lo_x, lo_y)
+    axs[0][0].set_title('more likely to have been {}'.format(base_title))
+    axs[0][1].barh(hi_x, hi_y)
+    axs[0][1].set_title('more likely to have been {}'.format(child_title))
+    axs[1][0].barh(lo_x, lo_freqs)
+    axs[1][0].set_title('word frequencies')
+    axs[1][1].barh(hi_x, hi_freqs)
+    axs[1][1].set_title('word frequencies')
+    fig.suptitle('SAGE score comparisons')
 
 
 def moderator_analysis(comments, min_action_threshold=10):
@@ -806,6 +939,14 @@ def moderator_analysis(comments, min_action_threshold=10):
         bonferonni_m += 1.0
     corrected_alpha = 0.05 / bonferonni_m
     print('bonferonni alpha for alpha=0.05 is {}'.format(corrected_alpha))
+    mods = []
+    bap = []
+    brp = []
+    bta = []
+    cap = []
+    crp = []
+    cta = []
+    tvals = []
     for mod in set(mod_conflict_idx.keys()).intersection(set(mod_baseline_idx.keys())):
         baseline_actions = np.array(mod_baseline_idx[mod])
         conf_actions = np.array(mod_conflict_idx[mod])
@@ -816,6 +957,14 @@ def moderator_analysis(comments, min_action_threshold=10):
             sig_chars = '***'
         else:
             sig_chars = ''
+        mods.append(mod)
+        bap.append(round(baseline_actions.mean(), 2))
+        brp.append(round(1-baseline_actions.mean(), 2))
+        bta.append(len(baseline_actions))
+        cap.append(round(conf_actions.mean(), 2))
+        crp.append(round(1-conf_actions.mean(), 2))
+        cta.append(len(conf_actions))
+        tvals.append('t({})={}, p={}{}'.format(len(baseline_actions) + len(conf_actions) - 2, round(stat, 2), p_value, sig_chars))
         print('\n\n\n\n----------------------------------------')
         print('stats for {}'.format(mod))
         print('approval proportion baseline {}'.format(baseline_actions.mean()))
@@ -826,21 +975,40 @@ def moderator_analysis(comments, min_action_threshold=10):
         print('conflict-race total actions {}'.format(len(conf_actions)))
         print('t={}, p-value={}{}'.format(stat, p_value, sig_chars))
         print('----------------------------------------')
+    fig = go.Figure(data=[go.Table(
+        header=dict(values=['Moderator', 'Baseline approval proportion', 'Baseline removal proportion', 'Baseline total actions', 'Conflict approval proportion', 'Conflict removal proportion', 'Conflict total actions', 't-test'],
+                    line_color='darkslategray',
+                    fill_color='lightskyblue',
+                    align='left'),
+        cells=dict(values=[mods,  # 1st column
+                           bap,
+                           brp,
+                           bta,
+                           cap,
+                           crp,
+                           cta,
+                           tvals
+                           ],
+                   line_color='darkslategray',
+                   fill_color='lightcyan',
+                   align='left'))
+    ])
 
+    fig.show()
 
 
 if __name__ == "__main__":
     comments_all = get_all_comments_from_db()
     comments_all = code_reports(comments_all)
     moderator_analysis(comments_all)
-    # print('got {} comments'.format(len(comments_all)))
+    print('got {} comments'.format(len(comments_all)))
     # count_removal_reasons(comments_all)
     # mod_action_statistics(comments_all)
+    bag_of_words_compare(comments_all)
     # analyze_conflict_and_concordance(comments_all)
-    # fix_none_reports(comments_all)
-    # analyze_report_long_tail(comments_all)
-
     # mod_conflict_statistics(comments_all)
     # compare_conflict_to_non_conflict(comments_all)
+    # fix_none_reports(comments_all)
+    # analyze_report_long_tail(comments_all)
     # last_entry(comments_all)
     # get_last_action_for_each_mod(comments_all)
