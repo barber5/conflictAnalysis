@@ -7,6 +7,9 @@ from math import log
 import plotly.graph_objects as go
 from dateutil import parser
 import scipy.stats as stats
+from sklearn.feature_extraction.text import CountVectorizer
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import OneHotEncoder
 
 import sage
 from config import APPROVE_ACTIONS, REMOVE_ACTIONS
@@ -997,14 +1000,183 @@ def moderator_analysis(comments, min_action_threshold=10):
     fig.show()
 
 
+def split_data(concordance_comments, conflict_comments):
+    X = []
+    y = []
+    for c in concordance_comments:
+        X.append(c)
+        y.append(1)
+    for c in conflict_comments:
+        X.append(c)
+        y.append(0)
+    return train_test_split(X, y, test_size=0.10, random_state=42)
+
+
+def get_document_vectorizer(X_train, cutoff=10):
+    word_freqs = get_bag_of_words_for_comments(X_train, proportion=False)
+    documents = []
+    vectorizer = CountVectorizer()
+    for c in X_train:
+        current = []
+        body = c['body']
+        stop_words = set(stopwords.words('english'))
+        word_tokens = word_tokenize(body.lower())
+        filtered_words = set([w for w in word_tokens if w not in stop_words])
+        for fw in filtered_words:
+            if fw not in word_freqs or word_freqs[fw] < cutoff:
+                continue
+            current.append(fw)
+        # current = np.array(current)
+        documents.append(' '.join(current))
+    vectorizer.fit(documents)
+    return vectorizer
+
+
+def word_vectorize_comments(comments, vectorizer):
+    word_freqs = get_bag_of_words_for_comments(comments, proportion=False)
+    documents = []
+    for c in comments:
+        current = []
+        body = c['body']
+        stop_words = set(stopwords.words('english'))
+        word_tokens = word_tokenize(body.lower())
+        filtered_words = set([w for w in word_tokens if w not in stop_words])
+        for fw in filtered_words:
+            current.append(fw)
+        # current = np.array(current)
+        documents.append(' '.join(current))
+    return vectorizer.transform(documents).toarray()
+
+
+def get_report_features(comments):
+    X = []
+    for c in comments:
+        politics = 0
+        info_quality = 0
+        incivility = 0
+        other = 0
+        bot = 0
+        spam = 0
+        none = 0
+        for r in c['reports'].values():
+            report = r['report']
+            count = r['count']
+            if report == 'politics':
+                politics += count
+            elif report == 'incivility':
+                incivility += count
+            elif report == 'information quality':
+                info_quality += count
+            elif report == 'spam':
+                spam += count
+            elif report == 'other':
+                other += count
+            elif report == 'bot generated report':
+                bot += count
+            elif report == 'no report':
+                none += count
+        X.append([politics, info_quality, incivility, other, bot, spam, none])
+    return X
+
+
+def get_ups_feature(comments):
+    X = []
+    for c in comments:
+        ups = c['ups']
+        X.append([ups])
+    return X
+
+
+def index_comments_by_author(comments):
+    author_idx = {}
+    for c in comments:
+        aid = c['aid']
+        if aid not in author_idx:
+            author_idx[aid] = []
+        author_idx[aid].append(c)
+    return author_idx
+
+
+def count_comments_before(comment, comment_idx):
+    aid = comment['aid']
+    when = comment['comment_created']
+    if aid not in comment_idx:
+        return 0
+    count = 0
+    for c in comment_idx[aid]:
+        c_when = c['comment_created']
+        if c_when < when:
+            count += 1
+    return count
+
+
+def get_prior_actions_features(comments, neither_comments, concordance_comments, conflict_comments, complex_comments):
+    approved_normal, removed_normal = get_approve_remove_comments(neither_comments)
+    a_idx = index_comments_by_author(approved_normal)
+    r_idx = index_comments_by_author(removed_normal)
+    conc_idx = index_comments_by_author(concordance_comments)
+    conf_idx = index_comments_by_author(conflict_comments)
+    comp_idx = index_comments_by_author(complex_comments)
+    X = []
+    for c in comments:
+        a_prior = count_comments_before(c, a_idx)
+        r_prior = count_comments_before(c, r_idx)
+        conc_prior = count_comments_before(c, conc_idx)
+        conf_prior = count_comments_before(c, conf_idx)
+        comp_prior = count_comments_before(c, comp_idx)
+        X.append([a_prior, r_prior, conc_prior, conf_prior, comp_prior])
+    return X
+
+
+def featurize(vectorizer, X, neither_comments, concordance_comments, conflict_comments, complex_comments):
+    X_train_vectorized = word_vectorize_comments(X, vectorizer)
+    X_reports = get_report_features(X)
+    X_ups = get_ups_feature(X)
+    X_prior_actions = get_prior_actions_features(X, neither_comments, concordance_comments, conflict_comments,
+                                                 complex_comments)
+    X = []
+    for i in range(len(X_train_vectorized)):
+        next_x = []
+        for k in X_ups[i]:
+            next_x.append(k)
+        for k in X_reports[i]:
+            next_x.append(k)
+        for k in X_prior_actions[i]:
+            next_x.append(k)
+        for k in X_train_vectorized[i]:
+            next_x.append(k)
+        X.append(np.array(next_x))
+    return np.array(X)
+
+
+def preprocess_data(comments):
+    complex_comments, concordance_comments, conflict_comments, neither_comments = categorize_comments_by_mod_action(
+        comments)
+    race_conc, revisit_conc = race_vs_revisit(concordance_comments)
+    race_conf, revisit_conf = race_vs_revisit(conflict_comments)
+
+    X_train, X_test, y_train, y_test = split_data(race_conc, race_conf)
+    vectorizer = get_document_vectorizer(X_train)
+    X_train = featurize(vectorizer, X_train, neither_comments, concordance_comments, conflict_comments,
+                        complex_comments)
+    X_test = featurize(vectorizer, X_test, neither_comments, concordance_comments, conflict_comments, complex_comments)
+    return X_train, X_test, y_train, y_test
+
+
+def classify_conflicts(comments):
+    X_train, X_test, y_train, y_test = preprocess_data(comments)
+    
+
+
 if __name__ == "__main__":
     comments_all = get_all_comments_from_db()
     comments_all = code_reports(comments_all)
-    moderator_analysis(comments_all)
+    # moderator_analysis(comments_all)
     print('got {} comments'.format(len(comments_all)))
     # count_removal_reasons(comments_all)
     # mod_action_statistics(comments_all)
-    bag_of_words_compare(comments_all)
+    # bag_of_words_compare(comments_all)
+    classify_conflicts(comments_all)
     # analyze_conflict_and_concordance(comments_all)
     # mod_conflict_statistics(comments_all)
     # compare_conflict_to_non_conflict(comments_all)
