@@ -7,8 +7,11 @@ from math import log
 import plotly.graph_objects as go
 from dateutil import parser
 import scipy.stats as stats
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.feature_extraction.text import CountVectorizer
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 from sklearn.model_selection import train_test_split
+from sklearn.naive_bayes import GaussianNB
 from sklearn.preprocessing import OneHotEncoder
 
 import sage
@@ -1005,11 +1008,11 @@ def split_data(concordance_comments, conflict_comments):
     y = []
     for c in concordance_comments:
         X.append(c)
-        y.append(1)
+        y.append(0)
     for c in conflict_comments:
         X.append(c)
-        y.append(0)
-    return train_test_split(X, y, test_size=0.10, random_state=42)
+        y.append(1)
+    return train_test_split(X, y, test_size=0.20)
 
 
 def get_document_vectorizer(X_train, cutoff=10):
@@ -1165,7 +1168,20 @@ def preprocess_data(comments):
 
 def classify_conflicts(comments):
     X_train, X_test, y_train, y_test = preprocess_data(comments)
-    
+    clf = RandomForestClassifier()
+    clf.fit(X_train, y_train)
+    y_pred = clf.predict(X_test)
+    y_train_pred = clf.predict(X_train)
+    cr = classification_report(y_test, y_pred)
+    print('classification report: {}'.format(cr))
+    cm = confusion_matrix(y_test, y_pred)
+    print('confusion matrix: {}'.format(cm))
+    acc = accuracy_score(y_test, y_pred)
+    print('test accuracy: {}'.format(acc))
+    train_acc = accuracy_score(y_train, y_train_pred)
+    print('train accuracy: {}'.format(train_acc))
+    print(y_pred)
+    print(np.array(y_test))
 
 
 if __name__ == "__main__":
