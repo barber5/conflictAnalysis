@@ -1003,16 +1003,16 @@ def moderator_analysis(comments, min_action_threshold=10):
     fig.show()
 
 
-def split_data(concordance_comments, conflict_comments):
+def split_data(negatives, positives):
     X = []
     y = []
-    for c in concordance_comments:
+    for c in negatives:
         X.append(c)
         y.append(0)
-    for c in conflict_comments:
+    for c in positives:
         X.append(c)
         y.append(1)
-    return train_test_split(X, y, test_size=0.20)
+    return train_test_split(X, y, test_size=0.10)
 
 
 def get_document_vectorizer(X_train, cutoff=10):
@@ -1036,7 +1036,7 @@ def get_document_vectorizer(X_train, cutoff=10):
 
 
 def word_vectorize_comments(comments, vectorizer):
-    word_freqs = get_bag_of_words_for_comments(comments, proportion=False)
+    # word_freqs = get_bag_of_words_for_comments(comments, proportion=False)
     documents = []
     for c in comments:
         current = []
@@ -1152,7 +1152,7 @@ def featurize(vectorizer, X, neither_comments, concordance_comments, conflict_co
     return np.array(X)
 
 
-def preprocess_data(comments):
+def preprocess_data_for_conflict_concordance_classification(comments):
     complex_comments, concordance_comments, conflict_comments, neither_comments = categorize_comments_by_mod_action(
         comments)
     race_conc, revisit_conc = race_vs_revisit(concordance_comments)
@@ -1163,11 +1163,11 @@ def preprocess_data(comments):
     X_train = featurize(vectorizer, X_train, neither_comments, concordance_comments, conflict_comments,
                         complex_comments)
     X_test = featurize(vectorizer, X_test, neither_comments, concordance_comments, conflict_comments, complex_comments)
-    return X_train, X_test, y_train, y_test
+    return X_train, X_test, y_train, y_test, vectorizer
 
 
 def classify_conflicts(comments):
-    X_train, X_test, y_train, y_test = preprocess_data(comments)
+    X_train, X_test, y_train, y_test, vectorizer = preprocess_data_for_conflict_concordance_classification(comments)
     clf = RandomForestClassifier()
     clf.fit(X_train, y_train)
     y_pred = clf.predict(X_test)
@@ -1180,8 +1180,100 @@ def classify_conflicts(comments):
     print('test accuracy: {}'.format(acc))
     train_acc = accuracy_score(y_train, y_train_pred)
     print('train accuracy: {}'.format(train_acc))
-    print(y_pred)
-    print(np.array(y_test))
+
+
+def get_mod_modeling_data(comments, vectorizer):
+    complex_comments, concordance_comments, conflict_comments, neither_comments = categorize_comments_by_mod_action(
+        comments)
+    approve_comments, remove_comments = get_approve_remove_comments(neither_comments)
+    X_train, X_test, y_train, y_test = split_data(approve_comments, remove_comments)
+    X_train = featurize(vectorizer, X_train, neither_comments, concordance_comments, conflict_comments,
+                        complex_comments)
+    X_test = featurize(vectorizer, X_test, neither_comments, concordance_comments, conflict_comments, complex_comments)
+    return X_train, X_test, y_train, y_test
+
+
+def get_mod_involved_comments(comments, moderator_name):
+    result = []
+    for comment in comments:
+        for action in comment['actions'].values():
+            if action['moderator'] == moderator_name:
+                result.append(comment)
+    return result
+
+
+def get_model_for_mod(comments, moderator_name, vectorizer):
+    mod_comments = get_mod_involved_comments(comments, moderator_name)
+    X_train, X_test, y_train, y_test = get_mod_modeling_data(mod_comments, vectorizer)
+    model = RandomForestClassifier()
+    model.fit(X_train, y_train)
+    y_pred = model.predict(X_test)
+    y_train_pred = model.predict(X_train)
+    cr = classification_report(y_test, y_pred)
+    print('classification report\n{}'.format(cr))
+    cm = confusion_matrix(y_test, y_pred)
+    print('confusion matrix\n{}'.format(cm))
+    acc = accuracy_score(y_test, y_pred)
+    print('test accuracy: {}'.format(acc))
+    train_acc = accuracy_score(y_train, y_train_pred)
+    print('train accuracy: {}'.format(train_acc))
+    return model
+
+
+def get_active_mods(comments, threshold):
+    activity_idx = {}
+    for comment in comments:
+        for action in comment['actions'].values():
+            modname = action['moderator']
+            if modname not in activity_idx:
+                activity_idx[modname] = 0
+            activity_idx[modname] += 1
+    result = []
+    for mod, actions in activity_idx.items():
+        if actions > threshold:
+            result.append(mod)
+    return result
+
+
+def classify_conflicts_with_mod_models(comments, mod_active_threshold=10000):
+    active_mods = get_active_mods(comments, mod_active_threshold)
+    X_train, X_test, y_train, y_test, vectorizer = preprocess_data_for_conflict_concordance_classification(comments)
+    print(active_mods)
+    models = {}
+    for mod in active_mods:
+        model = get_model_for_mod(comments, mod, vectorizer)
+        print('trained model for {}'.format(mod))
+        models[mod] = model
+
+    y_preds = {}
+    print('----------------------------------------------------')
+    for mod, model in models.items():
+        y_preds[mod] = model.predict(X_test)
+    for vote_threshold in [0.0, 0.25, 0.33, 0.5, 0.75, 0.85, 0.95, 1.0]:
+        print('with vote threshold: {}'.format(vote_threshold))
+        y_pred_aggregate = []
+        for i in range(len(y_test)):
+            # print('\n\ndata item {}'.format(i))
+            num0 = 0
+            num1 = 0
+            for mod, y_p in y_preds.items():
+                prediction = y_p[i]
+                if prediction == 0:
+                    num0 += 1
+                else:
+                    num1 += 1
+                # print('mod {}, prediction (0=approve, 1=remove): {}'.format(mod, prediction))
+            if max(num0, num1) / float(num0 + num1) >= vote_threshold:
+                y_pred_aggregate.append(0)
+            else:
+                y_pred_aggregate.append(1)
+            # print('--true label (0=concordance, 1=conflict): {}, number of approve votes: {}, number of remove votes: {}'.format(y_test[i], num0, num1))
+        cr = classification_report(y_test, y_pred_aggregate)
+        print('classification report\n{}'.format(cr))
+        cm = confusion_matrix(y_test, y_pred_aggregate)
+        print('confusion matrix\n{}'.format(cm))
+        acc = accuracy_score(y_test, y_pred_aggregate)
+        print('test accuracy: {}'.format(acc))
 
 
 if __name__ == "__main__":
@@ -1192,7 +1284,9 @@ if __name__ == "__main__":
     # count_removal_reasons(comments_all)
     # mod_action_statistics(comments_all)
     # bag_of_words_compare(comments_all)
-    classify_conflicts(comments_all)
+    # classify_conflicts(comments_all)
+    classify_conflicts_with_mod_models(comments_all)
+
     # analyze_conflict_and_concordance(comments_all)
     # mod_conflict_statistics(comments_all)
     # compare_conflict_to_non_conflict(comments_all)
